@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # https://websockets.readthedocs.io/en/stable/howto/quickstart.html , including wss
 
+from contextlib import suppress
 from time import sleep, time
 import random
 import itertools
@@ -73,23 +74,23 @@ def get_ip():
     s.close()
     return ip
 
-
 class Module:
     id_obj = itertools.count()
 
     def __init__(self, uuid) -> None:
-        self.name = "ModuleServer" + str(next(Module.id_obj))
+        self.name = "Module" + str(next(Module.id_obj))
         self.uuid = uuid  # if not empty -> change web side uuid(mid)
         self.keepSendingData = False
 
     async def rt_data_keep_send(self, websocket) -> None:
         # FIXME msg type incorrect
-        while (self.keepSendingData):
-            data = self.rt_data_generator()
-            msg = {"type": "dataRTKeepRequireResponse",
-                   "uuid": self.uuid, "data": data, "timestamp": time()}
-            await websocket.send(json.dumps(msg))
-            sleep(1)  # FIXME
+        while (True):
+            if (self.keepSendingData):
+                data = self.rt_data_generator()
+                msg = {"type": "dataRTKeepRequireResponse",
+                    "uuid": self.uuid, "data": data, "timestamp": time()}
+                await websocket.send(json.dumps(msg))
+                await asyncio.sleep(1)  # FIXME
 
     def rt_data_generator(self) -> str:
         return "send real time data"
@@ -100,26 +101,33 @@ class Server:
 
     def __init__(self, uuid) -> None:
         self.uuid = uuid
-        self.name = next(Server.id_obj)
+        self.name = "Server"+str(next(Server.id_obj))
         self.keepSendingData = False
 
-    async def drv_cmd_publisher(self, websocket) -> None:
-        while (self.keepSendingData):
-            data = self.drvcmd_generator()
-            msg = {"type": "drvCmdKeepRequireResponse",
-                   "uuid": self.uuid, "data": data, "timestamp": time()}
-            await websocket.send(json.dumps(msg))
-            sleep(1)  # FIXME
+    # move this to global task
+    # async def drv_cmd_publisher(self, websocket) -> None:
+    #     # https://github.com/aaugustin/websockets/commit/185e9c6e076aecdff0aee3e858049f569cc0ed8e#diff-368c3db875d0e24cdf70a9744bf49217b2210402b3813a599a96634a2361320d
+    #     # https://stackoverflow.com/questions/44982332/asyncio-await-and-infinite-loops
+    #     # https://stackoverflow.com/questions/69142556/use-the-same-websocket-connection-in-multiple-asynchronous-loops-python
+    #     # https://stackoverflow.com/questions/34499400/how-to-add-a-coroutine-to-a-running-asyncio-loop
+    #     while True:
+    #         if self.keepSendingData:
+    #             data = self.drvcmd_generator()
+    #             msg = {"type": "drvCmdKeepRequireResponse",
+    #                 "uuid": self.uuid, "data": data, "timestamp": time()}
+    #             await websocket.send(json.dumps(msg))
+    #             await asyncio.sleep(1)
 
-    def drvcmd_generator():
-        x, y, z = random.randint(0, 255), random.randint(
-            0, 255), random.randint(0, 255)
-        return {"x": x, "y": y, "z": z}
-
+def drvcmd_generator():
+    x, y, z = random.randint(50, 255), random.randint(
+        50, 255), random.randint(50, 255)
+    return {"x": x, "y": y, "z": z}
 
 # global state
 serverList = []
 moduleList = []
+
+ws_server_set = set() # for broadcast
 
 # TODO: 可以化簡
 # 避免先有其他 request， 統一處理未註冊狀態
@@ -233,17 +241,22 @@ async def server_parse(websocket, message) -> str:
     msg_rtn["uuid"] = target_uuid
     msg_rtn["type"] = msg_rtn_type
 
+    print("get type:{}", msg_type);
+
     if msg["type"] == "serverInfoRequire":
         server_candidate = try_to_find_server(target_uuid)
         msg_rtn["data"] = {"name": server_candidate.name}
 
     elif msg["type"] == "drvCmdKeepRequire":
+        
         server = try_to_find_server(target_uuid)
-        threading.Thread(target=server.drv_cmd_publisher(websocket=websocket))
+        server.keepSendingData = True
         msg_rtn["data"] = "ok"
 
     elif msg["type"] == "drvCmdStopRequire":
         msg_rtn["data"] = "ok"
+        server = try_to_find_server(target_uuid)
+        server.keepSendingData = False
 
     msg_rtn["timestamp"] = time()
 
@@ -262,19 +275,40 @@ async def module_echo(websocket):
         await websocket.send(msg_rtn)
 
 
-async def server_echo(websocket):
+async def server_echo(websocket): # handler
+    ws_server_set.add(websocket)
     async for message in websocket:
         msg_rtn = await server_parse(websocket, message)
 
         await websocket.send(msg_rtn)
 
+async def send(websocket, message):
+    try:
+        await websocket.send(message)
+    except websockets.ConnectionClosed:
+        pass
+
+async def broadcast(message): # real sender
+    for websocket in ws_server_set:
+            msg = json.dumps(message)
+            asyncio.create_task(send(websocket, msg))
+
+# according to https://github.com/aaugustin/websockets/commit/185e9c6e076aecdff0aee3e858049f569cc0ed8e?short_path=368c3db#diff-368c3db875d0e24cdf70a9744bf49217b2210402b3813a599a96634a2361320d
+async def server_broadcast_new_cmd(): # broadcast loop
+    while True:
+        await asyncio.sleep(0.1) # 10 msg/sec
+        data = drvcmd_generator()
+        message = {"type": "drvCmdKeepRequireResponse",
+                "uuid": "", "data": data, "timestamp": time()}
+        await broadcast(message)
 
 async def run_on_port(port1, port2):
     module_server = await websockets.serve(module_echo, get_ip(), port1)
     print("module open on ip:", get_ip(), "at port:", port1)
     main_server = await websockets.serve(server_echo, get_ip(), port2)
     print("server open on ip:", get_ip(), "at port:", port2)
-    await asyncio.gather(module_server.wait_closed(), main_server.wait_closed())
+    server_broadcast = await server_broadcast_new_cmd()
+    await asyncio.gather(module_server.wait_closed(), main_server.wait_closed(), server_broadcast)
     # await asyncio.Future()  # run forever
 
 
